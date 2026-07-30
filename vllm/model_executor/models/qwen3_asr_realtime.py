@@ -17,6 +17,7 @@
 """Inference-only Qwen3-ASR realtime model."""
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncGenerator, Mapping
 
 import numpy as np
@@ -209,27 +210,44 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # Rolling buffer: keep only the last N segments' output tokens
+        # to prevent context from growing unbounded over long audio.
+        max_context_segments = 6
+        recent_outputs: deque[list[int]] = deque(maxlen=max_context_segments)
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
-            # Drain the input_stream to prevent token accumulation
-            # since Qwen3-ASR treats each segment independently.
-            while not input_stream.empty():
-                try:
-                    input_stream.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
             while (segment := buffer.read_audio()) is not None:
+                # Collect latest output tokens from input_stream
+                seg_output: list[int] = []
+                while not input_stream.empty():
+                    try:
+                        seg_output.extend(input_stream.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if seg_output:
+                    recent_outputs.append(seg_output)
+
+                # Build context from recent outputs only
+                context_ids: list[int] = []
+                for out in recent_outputs:
+                    context_ids.extend(out)
+                ids = context_ids + prompt_token_ids if context_ids else prompt_token_ids
+
                 yield TokensPrompt(
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_token_ids=ids,
                     multi_modal_data={"audio": segment},
                 )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
+            context_ids = []
+            for out in recent_outputs:
+                context_ids.extend(out)
+            ids = context_ids + prompt_token_ids if context_ids else prompt_token_ids
             yield TokensPrompt(
-                prompt_token_ids=prompt_token_ids,
+                prompt_token_ids=ids,
                 multi_modal_data={"audio": remaining},
             )
 
