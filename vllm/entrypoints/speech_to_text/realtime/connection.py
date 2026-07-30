@@ -220,14 +220,6 @@ class RealtimeConnection:
                 skip_clone=True,
             )
 
-            # Create a streaming post-processor if the model provides one
-            # (e.g. Qwen3-ASR strips "<asr_text>" tags from deltas).
-            post_processor = None
-            if hasattr(self.serving.model_cls, "get_streaming_post_processor_cls"):
-                post_processor = (
-                    self.serving.model_cls.get_streaming_post_processor_cls()()
-                )
-
             # Pass the streaming input generator to the engine
             # The engine will consume audio chunks as they arrive and
             # stream back transcription results incrementally
@@ -243,22 +235,12 @@ class RealtimeConnection:
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
 
-                    raw_delta = output.outputs[0].text
-                    finished = output.outputs[0].finish_reason is not None
-
-                    # Apply streaming post-processing (e.g. strip
-                    # "<asr_text>" prefix from Qwen3-ASR output).
-                    if post_processor is not None:
-                        delta = post_processor.process_delta(raw_delta, finished)
-                    else:
-                        delta = raw_delta
-
-                    if delta:
-                        full_text += delta
-                        await self.send(TranscriptionDelta(delta=delta))
+                    delta = output.outputs[0].text
+                    full_text += delta
 
                     # append output to input
                     input_stream.put_nowait(list(output.outputs[0].token_ids))
+                    await self.send(TranscriptionDelta(delta=delta))
 
                     completion_tokens_len += len(output.outputs[0].token_ids)
 
@@ -275,9 +257,11 @@ class RealtimeConnection:
             # Send final completion event
             await self.send(TranscriptionDone(text=full_text, usage=usage))
 
-            # Clear queue for next utterance
+            # Clear queues for next utterance
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
+            while not input_stream.empty():
+                input_stream.get_nowait()
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)

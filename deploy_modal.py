@@ -1,48 +1,200 @@
-"""Modal 部署 Qwen3-ASR realtime（含无限重复修复）
+"""
+Modal 部署脚本: Qwen3-ASR-0.6B 语音识别服务 (预编译镜像方案)
+基于 huangazazaz/vllm_fix_asr 分支
 
-使用方法:
-    1. modal setup          # 绑定账号
-    2. modal deploy deploy_modal.py   # 部署
-    3. 拿到公网 URL，就能测试了
+策略: 先安装官方 vLLM pip 包 (预编译 C++/CUDA 扩展, 秒装),
+     再把 fork 的 ASR Python 代码覆盖上去, 跳过源码编译。
+     模型启动时从 HuggingFace 在线下载。
 
-测试:
-    pip install websockets pybase64
-    python examples/speech_to_text/realtime/openai_realtime_client.py \
-        --model Qwen3ASRRealtimeGeneration --host <url> --port 443
+部署:   modal deploy deploy_modal.py
 """
 
+import os
+import subprocess
 import modal
 
-MODEL_ID = "Qwen/Qwen3-ASR-1.5B"
+# =============================================================================
+# 配置
+# =============================================================================
 
-# 镜像：安装 Python 包 + 下载模型
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    # 从你的 fork 源码安装修复版 vllm（含补丁）
-    .pip_install(
-        "git+https://github.com/huangazazaz/vllm_fix_asr.git@fix/qwen3-asr-realtime-reset-context"
+MODEL_ID = "Qwen/Qwen3-ASR-0.6B-hf"
+MODEL_REMOTE_PATH = "/models/Qwen3-ASR-0.6B-hf"
+
+GPU_TYPE = "T4"
+GPU_COUNT = 1
+SCALEDOWN_WINDOW = 15 * 60
+
+VLLM_FORK_REPO = "https://github.com/huangazazaz/vllm_fix_asr.git"
+
+# =============================================================================
+# 持久化卷
+# =============================================================================
+
+vllm_cache_vol = modal.Volume.from_name(
+    "vllm-cache", create_if_missing=True
+)
+model_vol = modal.Volume.from_name(
+    "qwen3-asr-models", create_if_missing=True
+)
+
+# =============================================================================
+# 构建镜像: 官方 vLLM (预编译) + fork ASR 文件覆盖
+# =============================================================================
+
+vllm_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.9.0-devel-ubuntu22.04",
+        add_python="3.12",
     )
-    # 下载模型到镜像缓存，启动时直接加载
-    .pip_install("huggingface_hub[hf_transfer]")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .entrypoint([])
+    .apt_install("git", "libsndfile1", "ffmpeg", "libsoxr-dev")
+    # === 安装官方最新 vLLM (已有 qwen3_asr_realtime.py!) ===
     .run_commands(
-        f"python -c \"from huggingface_hub import snapshot_download; "
-        f"snapshot_download('{MODEL_ID}')\""
-        " && echo 'Model cached'"
+        "pip install --upgrade pip",
+        "pip install vllm[audio] huggingface_hub[hf_transfer]",
+    )
+    # === 用 fork 覆盖官方 vLLM（包含 input_stream 修复） ===
+    .run_commands(
+        f"git clone --depth 1 --single-branch {VLLM_FORK_REPO} /opt/vllm-fork",
+        # 清理缓存
+        "find /usr/local/lib/python3.12/site-packages/vllm -name '*.pyc' -delete",
+        "find /usr/local/lib/python3.12/site-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true",
+        # 覆盖 fork 所有文件
+        "cp -rf /opt/vllm-fork/vllm/* /usr/local/lib/python3.12/site-packages/vllm/",
+        # 额外音频依赖
+        "pip install soundfile librosa soxr pyav 2>/dev/null || true",
     )
 )
 
-app = modal.App("qwen3-asr", image=image)
+# =============================================================================
+# 服务
+# =============================================================================
+
+app = modal.App("vllm-qwen3-asr")
 
 
-@app.function(gpu="T4", timeout=3600, container_idle_timeout=300)
-@modal.asgi_app()
-def serve():
-    from vllm.entrypoints.openai.api_server import build_app
+@app.server(
+    image=vllm_image,
+    gpu=f"{GPU_TYPE}:{GPU_COUNT}",
+    scaledown_window=SCALEDOWN_WINDOW,
+    startup_timeout=600,
+    port=8000,
+    volumes={
+        "/root/.cache/vllm": vllm_cache_vol,
+        "/models": model_vol,
+    },
+    unauthenticated=True,
+)
+class VllmAsrServer:
+    """vLLM ASR 服务"""
 
-    return build_app(
-        model=MODEL_ID,
-        task="realtime",
-        enforce_eager=True,
-        max_model_len=4096,
-    )
+    @modal.enter()
+    def start(self):
+        import json
+
+        # === 从 HuggingFace 下载模型到持久卷 ===
+        from huggingface_hub import snapshot_download
+
+        os.environ["HF_HUB_CACHE"] = "/models"
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        if not os.path.isdir(MODEL_REMOTE_PATH):
+            print(f" 下载模型: {MODEL_ID} ...")
+            snapshot_download(MODEL_ID, local_dir=MODEL_REMOTE_PATH)
+        else:
+            print(f" 模型已缓存: {MODEL_REMOTE_PATH}")
+
+        # 修改 config.json: 用 Qwen3ASRRealtimeGeneration 替换基类架构
+        config_path = f"{MODEL_REMOTE_PATH}/config.json"
+        with open(config_path) as f:
+            config = json.load(f)
+        old_arch = config.get("architectures", [])
+        config["architectures"] = ["Qwen3ASRRealtimeGeneration"]
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f" Patched architectures: {old_arch} -> Qwen3ASRRealtimeGeneration")
+
+        print(f" Model: {MODEL_REMOTE_PATH}")
+        print(f" GPU:   {GPU_TYPE} x {GPU_COUNT}")
+
+        cmd = [
+            "vllm", "serve",
+            MODEL_REMOTE_PATH,
+            "--served-model-name", MODEL_ID,
+            "--host", "0.0.0.0",
+            "--port", "8000",
+            "--enforce-eager",
+            "--gpu-memory-utilization", "0.90",
+            "--max-model-len", "4096",
+            "--max-num-seqs", "16",
+            "--uvicorn-log-level", "info",
+        ]
+
+        print(f" CMD: {' '.join(cmd)}")
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        # 启动线程读取 vLLM 输出
+        import threading
+        self.output_lines = []
+        def read_output():
+            for line in self.process.stdout:
+                self.output_lines.append(line)
+                print(f" [vLLM] {line.rstrip()}")
+        self.output_thread = threading.Thread(target=read_output, daemon=True)
+        self.output_thread.start()
+
+        print(" Waiting...")
+        self._wait_ready(timeout=600)
+
+    def _wait_ready(self, timeout: int = 600):
+        import time
+        import urllib.request
+        import urllib.error
+
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.process.poll() is not None:
+                print(" vLLM crashed! Last output:")
+                for line in self.output_lines[-20:]:
+                    print(f"   {line.rstrip()}")
+                raise RuntimeError(
+                    f"vLLM exited with code {self.process.returncode}"
+                )
+            try:
+                req = urllib.request.Request("http://localhost:8000/health")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        print(f" Ready in {time.time() - start:.0f}s")
+                        return
+            except (urllib.error.URLError, ConnectionRefusedError, TimeoutError):
+                pass
+            time.sleep(5)
+        raise TimeoutError(f"Not ready within {timeout}s")
+
+    @modal.exit()
+    def stop(self):
+        if hasattr(self, "process") and self.process:
+            print(" Shutting down...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            print(" Stopped.")
+
+
+@app.local_entrypoint()
+def main():
+    print("=" * 60)
+    print(" Qwen3-ASR-0.6B Modal 部署 (预编译方案)")
+    print("=" * 60)
+    print()
+    print(" 策略: 官方 vLLM (预编译) + fork ASR 文件覆盖")
+    print(f" 模型: {MODEL_ID} (在线下载)")
+    print()
+    print(" 部署: modal deploy deploy_modal.py")
+    print("=" * 60)
